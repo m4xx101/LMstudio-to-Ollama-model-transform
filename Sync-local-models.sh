@@ -52,7 +52,12 @@ EXCLUDE_FILTER='(mmproj|mm-proj)|\.(downloading|incomplete|partial)$'
 OLLAMA_TEMPLATE=""
 FORCE=0
 DRY_RUN=0
+PARALLEL=0
+PARALLEL_JOBS=4
 LOG_PATH="${TMPDIR:-/tmp}/sync-local-models-$(date +%Y%m%d-%H%M%S).log"
+
+# Cache file for Ollama model list (populated once, used many times)
+OLLAMA_LIST_CACHE=""
 
 # Stats (using simple vars since bash 3.2 has no associative arrays)
 STAT_DISCOVERED=0
@@ -131,6 +136,8 @@ OPTIONS
                             leave empty to rely on GGUF autodetection
   --force                   re-register models that already exist
   --dry-run                 print what would happen, change nothing
+  --parallel [N]              run Ollama registrations in parallel with N jobs
+                            (default: 4). Significantly faster for many models.
   --log-path PATH           log file (default: a timestamped file in TMPDIR)
   -h, --help                show this help
 
@@ -141,6 +148,9 @@ EXAMPLES
   # Ollama + text-generation-webui in one pass
   $0 --target ollama,text-generation-webui \\
      --textgen-models-dir ~/ai/textgen/user_data/models
+
+  # Parallel Ollama registration (much faster for many models)
+  $0 --target ollama --parallel 8
 
   # Everything, with a namespace prefix, overwrite existing
   $0 --target all \\
@@ -170,6 +180,16 @@ while [ $# -gt 0 ]; do
         --ollama-template)     OLLAMA_TEMPLATE="$2";     shift 2 ;;
         --force)               FORCE=1;                  shift ;;
         --dry-run)             DRY_RUN=1;                shift ;;
+        --parallel)
+            PARALLEL=1
+            # Check if next arg is a number (job count)
+            if [ $# -gt 1 ] && printf '%s' "$2" | grep -Eq '^[0-9]+$'; then
+                PARALLEL_JOBS="$2"
+                shift 2
+            else
+                shift
+            fi
+            ;;
         --log-path)            LOG_PATH="$2";            shift 2 ;;
         -h|--help)             show_help; exit 0 ;;
         *)  echo "Unknown argument: $1" >&2; echo "Use --help for usage." >&2; exit 64 ;;
@@ -197,11 +217,28 @@ safe_name() {
     printf '%s' "${name}"
 }
 
+# Populate Ollama model list cache (call once before processing)
+populate_ollama_cache() {
+    if command -v ollama >/dev/null 2>&1; then
+        OLLAMA_LIST_CACHE=$(mktemp "${TMPDIR:-/tmp}/ollama-cache.XXXXXX")
+        ollama list 2>/dev/null | awk 'NR>1 {print $1}' > "${OLLAMA_LIST_CACHE}" 2>/dev/null || true
+    fi
+}
+
+# Clean up cache on exit
+cleanup_ollama_cache() {
+    [ -n "${OLLAMA_LIST_CACHE}" ] && [ -f "${OLLAMA_LIST_CACHE}" ] && rm -f "${OLLAMA_LIST_CACHE}"
+}
+
 # Does Ollama already know about a given model name?
 ollama_has_model() {
     name="$1"
     if ! command -v ollama >/dev/null 2>&1; then return 1; fi
-    ollama list 2>/dev/null | awk 'NR>1 {print $1}' | grep -E "^${name}(:.*)?$" >/dev/null 2>&1
+    if [ -n "${OLLAMA_LIST_CACHE}" ] && [ -f "${OLLAMA_LIST_CACHE}" ]; then
+        grep -E "^${name}(:.*)?$" "${OLLAMA_LIST_CACHE}" >/dev/null 2>&1
+    else
+        ollama list 2>/dev/null | awk 'NR>1 {print $1}' | grep -E "^${name}(:.*)?$" >/dev/null 2>&1
+    fi
 }
 
 # Check if two paths are on the same filesystem (device id).
@@ -270,6 +307,27 @@ make_link() {
 # ---------------------------------------------------------------------------
 # Prerequisite checks
 # ---------------------------------------------------------------------------
+check_ollama_ready() {
+    # Check if Ollama service is ready (not in "upgrade in progress" state)
+    if ! command -v ollama >/dev/null 2>&1; then
+        return 1
+    fi
+    out=$(ollama list 2>&1)
+    exit_code=$?
+    if [ ${exit_code} -ne 0 ]; then
+        case "${out}" in
+            *"upgrade in progress"*)
+                log ERROR "Ollama is currently upgrading. Wait for the upgrade to complete, or restart the Ollama service."
+                ;;
+            *)
+                log ERROR "Ollama service not responding. Ensure Ollama is running. Error: ${out}"
+                ;;
+        esac
+        return 1
+    fi
+    return 0
+}
+
 check_prereqs() {
     ok=1
 
@@ -293,6 +351,8 @@ check_prereqs() {
             ollama)
                 if ! command -v ollama >/dev/null 2>&1; then
                     log ERROR "Ollama not found in PATH. Install from https://ollama.com or remove 'ollama' from --target."
+                    ok=0
+                elif ! check_ollama_ready; then
                     ok=0
                 else
                     log OK "Ollama found: $(command -v ollama)"
@@ -560,9 +620,12 @@ run_sync() {
     IFS="${old_ifs}"
 
     log INFO "Active targets: ${filtered}"
+    if [ "${PARALLEL}" -eq 1 ]; then
+        log OK "Parallel mode enabled (${PARALLEL_JOBS} jobs) — Ollama registrations will run concurrently"
+    fi
 
     tmp_models="$(mktemp "${TMPDIR:-/tmp}/syncmodels.XXXXXX")"
-    trap 'rm -f "${tmp_models}"' EXIT
+    trap 'rm -f "${tmp_models}"; cleanup_ollama_cache' EXIT
 
     discover_models "${tmp_models}"
     STAT_DISCOVERED="$(wc -l < "${tmp_models}" | tr -d ' ')"
@@ -572,37 +635,95 @@ run_sync() {
         return
     fi
 
-    i=0
-    while IFS='|' read -r full base publisher modeldir size; do
-        i=$((i + 1))
-        size_mb=$(( size / 1048576 ))
-        log INFO "[${i}/${STAT_DISCOVERED}] $(basename "${full}")  (${size_mb} MiB)"
+    # Pre-cache Ollama list for faster duplicate detection
+    case ",${filtered}," in
+        *,ollama,*)
+            log INFO "Caching Ollama model list for quick duplicate detection..."
+            populate_ollama_cache
+            ;;
+    esac
 
-        old_ifs="${IFS}"; IFS=,
-        for t in ${filtered}; do
-            IFS="${old_ifs}"
-            # Wrap each target call so a failure is logged but doesn't abort
-            (
+    # Separate Ollama from other targets (non-Ollama are fast, do them sequentially)
+    has_ollama=0
+    case ",${filtered}," in
+        *,ollama,*) has_ollama=1 ;;
+    esac
+
+    # Process non-Ollama targets first (always sequential)
+    other_targets="${filtered}"
+    other_targets="${other_targets%,ollama}"
+    other_targets="${other_targets#ollama,}"
+    other_targets="${other_targets/,ollama,/,}"
+
+    if [ -n "${other_targets}" ] && [ "${other_targets}" != "ollama" ]; then
+        i=0
+        while IFS='|' read -r full base publisher modeldir size; do
+            i=$((i + 1))
+            old_ifs="${IFS}"; IFS=,
+            for t in ${other_targets}; do
+                IFS="${old_ifs}"
                 case "${t}" in
-                    ollama)                register_ollama   "${full}" "${base}" ;;
-                    text-generation-webui) register_textgen  "${full}" ;;
-                    koboldcpp)             write_launcher    "${full}" "${base}" koboldcpp ;;
-                    llamacpp-server)       write_launcher    "${full}" "${base}" llamacpp-server ;;
-                    jan)                   register_jan      "${full}" "${modeldir}" ;;
+                    ollama) continue ;; # Skip Ollama here
+                    *)
+                    (
+                        case "${t}" in
+                            text-generation-webui) register_textgen  "${full}" ;;
+                            koboldcpp)             write_launcher    "${full}" "${base}" koboldcpp ;;
+                            llamacpp-server)       write_launcher    "${full}" "${base}" llamacpp-server ;;
+                            jan)                   register_jan      "${full}" "${modeldir}" ;;
+                        esac
+                    ) || true
+                    ;;
                 esac
-            ) || true
-            IFS=,
-        done
-        IFS="${old_ifs}"
-    done < "${tmp_models}"
+                IFS=,
+            done
+            IFS="${old_ifs}"
+        done < "${tmp_models}"
+    fi
 
-    # Subshells above broke stat inheritance; re-count registrations from log
-    # for an accurate summary. (A pragmatic workaround for POSIX sh scoping.)
-    # Use `grep | wc -l` rather than `grep -c` so a zero count is always a
-    # single number even when the fallback fires.
+    # Process Ollama (sequential or parallel)
+    if [ "${has_ollama}" -eq 1 ]; then
+        if [ "${PARALLEL}" -eq 1 ] && command -v xargs >/dev/null 2>&1; then
+            # Parallel mode using xargs -P
+            export -f register_ollama safe_name log ollama_has_model
+            export OLLAMA_CATALOG OLLAMA_TEMPLATE NAME_PREFIX FORCE DRY_RUN LOG_PATH STAT_REGISTERED STAT_SKIPPED STAT_FAILED
+
+            # Create a temp script for parallel execution
+            parallel_script="$(mktemp "${TMPDIR:-/tmp}/parallel-ollama.XXXXXX")"
+            cat > "${parallel_script}" << 'PARALLEL_EOF'
+#!/usr/bin/env bash
+line="$1"
+IFS='|' read -r full base publisher modeldir size <<< "${line}"
+size_mb=$(( size / 1048576 ))
+log INFO "[parallel] $(basename "${full}")  (${size_mb} MiB)"
+register_ollama "${full}" "${base}"
+PARALLEL_EOF
+            chmod +x "${parallel_script}"
+
+            # Export functions and run in parallel
+            export -f register_ollama safe_name log ollama_has_model
+            export NAME_PREFIX OLLAMA_CATALOG OLLAMA_TEMPLATE FORCE DRY_RUN LOG_PATH
+
+            # Use xargs for parallel execution
+            cat "${tmp_models}" | xargs -P "${PARALLEL_JOBS}" -I {} "${parallel_script}" "{}"
+
+            rm -f "${parallel_script}"
+        else
+            # Sequential mode
+            i=0
+            while IFS='|' read -r full base publisher modeldir size; do
+                i=$((i + 1))
+                size_mb=$(( size / 1048576 ))
+                log INFO "[${i}/${STAT_DISCOVERED}] $(basename "${full}")  (${size_mb} MiB)"
+                register_ollama "${full}" "${base}"
+            done < "${tmp_models}"
+        fi
+    fi
+
+    # Re-count stats from log (subshells broke the variables)
     STAT_REGISTERED=$(grep -E '\[OK   \] (Ollama registered|text-generation-webui:|Jan:|koboldcpp launcher|llamacpp-server launcher)' "${LOG_PATH}" 2>/dev/null | wc -l | tr -d ' ')
-    STAT_SKIPPED=$(   grep -E '\[WARN \] .* already has'                                                           "${LOG_PATH}" 2>/dev/null | wc -l | tr -d ' ')
-    STAT_FAILED=$(    grep -E '\[ERROR\] (ollama create|Failed to link)'                                           "${LOG_PATH}" 2>/dev/null | wc -l | tr -d ' ')
+    STAT_SKIPPED=$(   grep -E '\[WARN \] .* (already has|— skip)'                                          "${LOG_PATH}" 2>/dev/null | wc -l | tr -d ' ')
+    STAT_FAILED=$(    grep -E '\[ERROR\] (ollama create|Failed to link)'                                    "${LOG_PATH}" 2>/dev/null | wc -l | tr -d ' ')
 }
 
 print_summary() {
