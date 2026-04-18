@@ -68,6 +68,14 @@
     Re-register models that already exist. Overwrites links, Modelfiles and
     Ollama entries.
 
+.PARAMETER Parallel
+    Process Ollama registrations in parallel (requires PowerShell 7+).
+    Significantly faster when registering many models.
+
+.PARAMETER ParallelThrottle
+    Maximum number of parallel Ollama create operations. Default: 4.
+    Higher values use more CPU/memory but may complete faster.
+
 .PARAMETER LogPath
     Path to the log file. Default is a timestamped file under %TEMP%.
 
@@ -84,6 +92,10 @@
         -KoboldCppExe 'D:\ai\koboldcpp\koboldcpp.exe' `
         -LlamaCppDir 'D:\ai\llama.cpp\bin' `
         -NamePrefix 'lms-' -Force
+
+.EXAMPLE
+    # Parallel mode (PowerShell 7+) — much faster for many models
+    .\Sync-LocalModels.ps1 -Target Ollama -Parallel -ParallelThrottle 8
 
 .NOTES
     Author: m4xx (Deepak Mistry) — template by Claude
@@ -113,6 +125,10 @@ param(
     [string]$OllamaTemplate = '',
 
     [switch]$Force,
+
+    [switch]$Parallel,
+
+    [int]$ParallelThrottle = 4,
 
     [string]$LogPath = (Join-Path $env:TEMP "sync-local-models-$(Get-Date -Format 'yyyyMMdd-HHmmss').log")
 )
@@ -158,6 +174,25 @@ function Write-Log {
 # ---------------------------------------------------------------------------
 # Prerequisites
 # ---------------------------------------------------------------------------
+function Test-OllamaReady {
+    # Check if Ollama service is ready (not in "upgrade in progress" state)
+    try {
+        $out = & ollama list 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            if ($out -match 'upgrade in progress') {
+                Write-Log "Ollama is currently upgrading. Wait for the upgrade to complete, or restart the Ollama service." ERROR
+            } else {
+                Write-Log "Ollama service not responding. Ensure Ollama is running. Error: $out" ERROR
+            }
+            return $false
+        }
+        return $true
+    } catch {
+        Write-Log "Failed to communicate with Ollama: $($_.Exception.Message)" ERROR
+        return $false
+    }
+}
+
 function Test-Prerequisites {
     [CmdletBinding()]
     param([string[]]$Targets)
@@ -179,6 +214,8 @@ function Test-Prerequisites {
             'Ollama' {
                 if (-not (Get-Command ollama -ErrorAction SilentlyContinue)) {
                     Write-Log "Ollama not found in PATH. Install from https://ollama.com or remove 'Ollama' from -Target." ERROR
+                    $ok = $false
+                } elseif (-not (Test-OllamaReady)) {
                     $ok = $false
                 } else {
                     Write-Log "Ollama found: $((Get-Command ollama).Source)" OK
@@ -342,16 +379,28 @@ function New-ModelLink {
     }
 }
 
+# Global cache for Ollama model list (populated once, used many times)
+$script:OllamaModelCache = $null
+
 # ---------------------------------------------------------------------------
 # Target: Ollama
 # ---------------------------------------------------------------------------
+function Get-OllamaModelList {
+    if ($null -eq $script:OllamaModelCache) {
+        try {
+            $script:OllamaModelCache = & ollama list 2>$null
+        } catch {
+            $script:OllamaModelCache = @()
+        }
+    }
+    return $script:OllamaModelCache
+}
+
 function Test-OllamaHasModel {
     param([string]$Name)
-    try {
-        $list = & ollama list 2>$null
-        if ($LASTEXITCODE -ne 0) { return $false }
-        return ($list | Select-String -Pattern "^\s*$([regex]::Escape($Name))(?::|\s)" -Quiet)
-    } catch { return $false }
+    $list = Get-OllamaModelList
+    if ($LASTEXITCODE -ne 0) { return $false }
+    return ($list | Select-String -Pattern "^\s*$([regex]::Escape($Name))(?::|\s)" -Quiet)
 }
 
 function Register-OllamaModel {
@@ -525,6 +574,9 @@ function Invoke-Sync {
     }
 
     Write-Log "Active targets: $($targets -join ', ')"
+    if ($Parallel -and ($PSVersionTable.PSVersion.Major -ge 7)) {
+        Write-Log "Parallel mode enabled (throttle: $ParallelThrottle) — Ollama registrations will run concurrently" OK
+    }
     foreach ($t in $targets) { $script:Stats.Targets[$t] = @{ Registered = 0; Skipped = 0; Failed = 0 } }
 
     $models = Get-GgufModels -Root $Source
@@ -534,36 +586,107 @@ function Invoke-Sync {
         return
     }
 
-    $i = 0
-    foreach ($m in $models) {
-        $i++
-        $pct = [int](($i / $models.Count) * 100)
-        Write-Progress -Activity "Syncing models" -Status "$i / $($models.Count) — $($m.FileName)" -PercentComplete $pct
-        Write-Log ("[{0}/{1}] {2}  ({3:N1} MiB)" -f $i, $models.Count, $m.FileName, ($m.Size / 1MB))
+    # Pre-cache Ollama list for faster lookups
+    if ($targets -contains 'Ollama') {
+        Write-Log "Caching Ollama model list for quick duplicate detection..."
+        $null = Get-OllamaModelList
+    }
 
-        foreach ($t in $targets) {
-            try {
-                $r = switch ($t) {
-                    'Ollama'              { Register-OllamaModel -Model $m }
-                    'TextGenerationWebUI' { Register-TextGenModel -Model $m }
-                    'KoboldCpp'           { New-LauncherBat       -Model $m -Kind KoboldCpp }
-                    'LlamaCppServer'      { New-LauncherBat       -Model $m -Kind LlamaCppServer }
-                    'Jan'                 { Register-JanModel     -Model $m }
+    # Process non-Ollama targets sequentially first (they're fast)
+    $otherTargets = $targets | Where-Object { $_ -ne 'Ollama' }
+    $ollamaTarget = $targets | Where-Object { $_ -eq 'Ollama' }
+
+    # Process non-Ollama targets sequentially
+    if ($otherTargets) {
+        $i = 0
+        foreach ($m in $models) {
+            $i++
+            foreach ($t in $otherTargets) {
+                try {
+                    $r = switch ($t) {
+                        'TextGenerationWebUI' { Register-TextGenModel -Model $m }
+                        'KoboldCpp'           { New-LauncherBat       -Model $m -Kind KoboldCpp }
+                        'LlamaCppServer'      { New-LauncherBat       -Model $m -Kind LlamaCppServer }
+                        'Jan'                 { Register-JanModel     -Model $m }
+                    }
+                    switch ($r.Status) {
+                        'Registered' { $script:Stats.Targets[$t].Registered++; $script:Stats.Registered++ }
+                        'Skipped'    { $script:Stats.Targets[$t].Skipped++;    $script:Stats.Skipped++ }
+                        'Failed'     { $script:Stats.Targets[$t].Failed++;     $script:Stats.Failed++ }
+                        'Planned'    { }
+                    }
+                } catch {
+                    Write-Log "Unhandled error registering $($m.FileName) with $t : $($_.Exception.Message)" ERROR
+                    $script:Stats.Targets[$t].Failed++
+                    $script:Stats.Failed++
                 }
-                switch ($r.Status) {
-                    'Registered' { $script:Stats.Targets[$t].Registered++; $script:Stats.Registered++ }
-                    'Skipped'    { $script:Stats.Targets[$t].Skipped++;    $script:Stats.Skipped++ }
-                    'Failed'     { $script:Stats.Targets[$t].Failed++;     $script:Stats.Failed++ }
-                    'Planned'    { } # dry-run
-                }
-            } catch {
-                Write-Log "Unhandled error registering $($m.FileName) with $t : $($_.Exception.Message)" ERROR
-                $script:Stats.Targets[$t].Failed++
-                $script:Stats.Failed++
             }
         }
     }
-    Write-Progress -Activity "Syncing models" -Completed
+
+    # Process Ollama with optional parallelization
+    if ($ollamaTarget) {
+        if ($Parallel -and ($PSVersionTable.PSVersion.Major -ge 7)) {
+            # PowerShell 7+ parallel mode
+            $models | ForEach-Object -Parallel {
+                # Import functions and variables needed in parallel scope
+                ${function:Register-OllamaModel} = ${using:function:Register-OllamaModel}
+                ${function:Write-Log} = ${using:function:Write-Log}
+                ${function:Get-SafeOllamaName} = ${using:function:Get-SafeOllamaName}
+                ${function:Get-OllamaModelList} = ${using:function:Get-OllamaModelList}
+                $script:OllamaModelCache = ${using:script:OllamaModelCache}
+                $NamePrefix = ${using:NamePrefix}
+                $OllamaCatalog = ${using:OllamaCatalog}
+                $OllamaTemplate = ${using:OllamaTemplate}
+                $Force = ${using:Force}
+
+                $m = $_
+                try {
+                    $r = Register-OllamaModel -Model $m
+                    [PSCustomObject]@{ Status = $r.Status; Name = $r.Name; Target = 'Ollama' }
+                } catch {
+                    [PSCustomObject]@{ Status = 'Failed'; Name = $m.BaseName; Target = 'Ollama'; Error = $_.Exception.Message }
+                }
+            } -ThrottleLimit $ParallelThrottle | ForEach-Object {
+                switch ($_.Status) {
+                    'Registered' { $script:Stats.Targets['Ollama'].Registered++; $script:Stats.Registered++ }
+                    'Skipped'      { $script:Stats.Targets['Ollama'].Skipped++;    $script:Stats.Skipped++ }
+                    'Failed'       { $script:Stats.Targets['Ollama'].Failed++;     $script:Stats.Failed++ }
+                }
+                if ($_.Error) {
+                    Write-Log "Parallel Ollama error for $($_.Name): $($_.Error)" ERROR
+                }
+            }
+        } else {
+            # Sequential mode (PowerShell 5.1 or -Parallel not specified)
+            if ($Parallel -and ($PSVersionTable.PSVersion.Major -lt 7)) {
+                Write-Log "Parallel mode requires PowerShell 7+. Falling back to sequential processing." WARN
+            }
+
+            $i = 0
+            foreach ($m in $models) {
+                $i++
+                $pct = [int](($i / $models.Count) * 100)
+                Write-Progress -Activity "Syncing Ollama models" -Status "$i / $($models.Count) — $($m.FileName)" -PercentComplete $pct
+                Write-Log ("[{0}/{1}] {2}  ({3:N1} MiB)" -f $i, $models.Count, $m.FileName, ($m.Size / 1MB))
+
+                try {
+                    $r = Register-OllamaModel -Model $m
+                    switch ($r.Status) {
+                        'Registered' { $script:Stats.Targets['Ollama'].Registered++; $script:Stats.Registered++ }
+                        'Skipped'    { $script:Stats.Targets['Ollama'].Skipped++;    $script:Stats.Skipped++ }
+                        'Failed'     { $script:Stats.Targets['Ollama'].Failed++;     $script:Stats.Failed++ }
+                        'Planned'    { }
+                    }
+                } catch {
+                    Write-Log "Unhandled error registering $($m.FileName) with Ollama : $($_.Exception.Message)" ERROR
+                    $script:Stats.Targets['Ollama'].Failed++
+                    $script:Stats.Failed++
+                }
+            }
+            Write-Progress -Activity "Syncing Ollama models" -Completed
+        }
+    }
 }
 
 function Write-Summary {
